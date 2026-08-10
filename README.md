@@ -142,6 +142,14 @@ Find the RPi5 IP address from your router's DHCP client list (look for hostname 
 ssh <username>@<ip-address>
 ```
 
+> **Tip:** If your local network supports mDNS (Bonjour/Avahi — enabled by default on macOS and most Linux distros; on Windows install "Bonjour Print Services" or use it via iTunes/Chrome), you can use the hostname instead of hunting for the IP address:
+>
+> ```bash
+> ssh <username>@wifi-sniffer.local
+> ```
+>
+> This works anywhere an IP address is used in this guide (SSH, `scp`, wifidump's "Remote SSH server address"), as long as the hostname was kept as `wifi-sniffer` in Section 2.3.
+
 Verify internet connectivity:
 
 ```bash
@@ -275,7 +283,7 @@ If it is missing:
 1. In Wireshark, look for **"Wi-Fi remote capture"** in the interface list.
 2. Click the **gear icon** next to it.
 3. Configure:
-   - **Remote SSH server address:** `<rpi-ip>`
+   - **Remote SSH server address:** `<rpi-ip>` or `wifi-sniffer.local`
    - **Remote SSH username:** the username from the image
    - **Remote SSH password:** the password from the image
    - **Remote interface:** `mon0`

@@ -12,6 +12,11 @@
 # The script requires sudo — it will prompt for your password.
 # Do NOT run it as root directly (sudo ./setup-wifi-sniffer.sh) —
 # the script uses $USER to configure per-user settings (sudoers, wireshark group).
+#
+# Safe to re-run any time (idempotent) — re-running repairs missing/broken
+# packages, permissions, and systemd services. It will NOT overwrite your
+# hostapd/dnsmasq/mon0-channel config files if you've already customized them
+# (delete a file first to reset it to the script's default).
 # =============================================================================
 
 set -uo pipefail
@@ -41,7 +46,7 @@ echo ""
 # =============================================================================
 # STEP 1 — System Update & Package Installation
 # =============================================================================
-echo "--- [1/6] System Update & Package Installation ---"
+echo "--- [1/7] System Update & Package Installation ---"
 
 $APT update || die "apt update failed — check network connectivity"
 $APT full-upgrade -y \
@@ -121,12 +126,12 @@ IP_PATH=$(command -v ip 2>/dev/null || { [ -x /usr/sbin/ip ] && echo /usr/sbin/i
 # DUMPCAP_PATH already resolved above
 [ -z "$IP_PATH" ] && die "ip not found"
 SUDOERS_FILE="/etc/sudoers.d/wifidump"
-echo "$SCRIPT_USER ALL=(ALL) NOPASSWD: $IP_PATH, /usr/local/bin/iw, $DUMPCAP_PATH" \
+echo "$SCRIPT_USER ALL=(ALL) NOPASSWD: $IP_PATH, /usr/local/bin/iw, $DUMPCAP_PATH, /usr/local/bin/mon0-set-channel" \
   | sudo tee "$SUDOERS_FILE" > /dev/null
 sudo chmod 440 "$SUDOERS_FILE"
 # Validate the file — sudo will ignore sudoers.d files with syntax errors
 sudo visudo -c -f "$SUDOERS_FILE" > /dev/null \
-  && echo "  Created $SUDOERS_FILE (/usr/local/bin/iw, $IP_PATH, $DUMPCAP_PATH)" \
+  && echo "  Created $SUDOERS_FILE (/usr/local/bin/iw, $IP_PATH, $DUMPCAP_PATH, /usr/local/bin/mon0-set-channel)" \
   || echo "  WARNING: $SUDOERS_FILE failed visudo check — check paths manually"
 
 echo "  Step 1 done."
@@ -135,7 +140,7 @@ echo "  Step 1 done."
 # STEP 2 — NetworkManager / dhcpcd: Exclude wlan1 and ap0
 # =============================================================================
 echo ""
-echo "--- [2/6] NetworkManager / dhcpcd — Excluding wlan1 and ap0 ---"
+echo "--- [2/7] NetworkManager / dhcpcd — Excluding wlan1 and ap0 ---"
 
 # Mark unmanaged via nmcli (may fail if adapter not plugged in yet — that's OK)
 sudo nmcli dev set wlan1 managed no 2>/dev/null || true
@@ -165,7 +170,7 @@ fi
 # STEP 3 — wlan1-monitor Systemd Service (creates mon0 at boot)
 # =============================================================================
 echo ""
-echo "--- [3/6] Monitor Mode Service (wlan1-monitor) ---"
+echo "--- [3/7] Monitor Mode Service (wlan1-monitor) ---"
 
 sudo tee /etc/systemd/system/wlan1-monitor.service > /dev/null <<'EOF'
 [Unit]
@@ -194,7 +199,7 @@ echo "  wlan1-monitor enabled (starts when Alfa adapter is plugged in)."
 # STEP 4 — iperf Persistent Services
 # =============================================================================
 echo ""
-echo "--- [4/6] iperf Persistent Services ---"
+echo "--- [4/7] iperf Persistent Services ---"
 
 # iperf2 TCP — port 5001, Zephyr zperf compatible
 sudo tee /etc/systemd/system/iperf2-tcp.service > /dev/null <<'EOF'
@@ -246,12 +251,17 @@ echo "  iperf2-tcp, iperf2-udp, iperf3 enabled."
 # STEP 5 — AP Mode Pre-configuration (hostapd + dnsmasq)
 # =============================================================================
 echo ""
-echo "--- [5/6] AP Mode Pre-configuration ---"
+echo "--- [5/7] AP Mode Pre-configuration ---"
 
 sudo mkdir -p /etc/hostapd
 
 # Default: 5 GHz, channel 36, 802.11ax (Wi-Fi 6)
 # Edit /etc/hostapd/hostapd-ap0.conf to change band/channel/technology
+# Skipped if the file already exists so a re-run doesn't clobber your edits
+# (e.g. a custom channel or passphrase) — delete the file to regenerate defaults.
+if [ -f /etc/hostapd/hostapd-ap0.conf ]; then
+    echo "  /etc/hostapd/hostapd-ap0.conf already exists — leaving your customizations intact."
+else
 sudo tee /etc/hostapd/hostapd-ap0.conf > /dev/null <<'EOF'
 interface=ap0
 driver=nl80211
@@ -335,16 +345,22 @@ wpa_passphrase=TestPassword123
 wpa_key_mgmt=WPA-PSK
 rsn_pairwise=CCMP
 EOF
+fi
 
 # dnsmasq config for AP clients (192.168.99.x)
 # listen-address is used instead of interface= + bind-interfaces because
 # dnsmasq cannot resolve dynamically created VIF interfaces by name at startup.
+# Skipped if it already exists — see note above.
+if [ -f /etc/dnsmasq-ap0.conf ]; then
+    echo "  /etc/dnsmasq-ap0.conf already exists — leaving your customizations intact."
+else
 sudo tee /etc/dnsmasq-ap0.conf > /dev/null <<'EOF'
 listen-address=192.168.99.1
 bind-interfaces
 dhcp-range=192.168.99.100,192.168.99.200,255.255.255.0,24h
 dhcp-option=3,192.168.99.1
 EOF
+fi
 
 # Disable the system dnsmasq service — it conflicts with the AP-specific instance
 # started by ap-enable. DHCP is only needed when the AP is active.
@@ -436,10 +452,105 @@ sudo chmod +x /usr/local/bin/ap-disable
 echo "  ap-enable and ap-disable installed to /usr/local/bin/"
 
 # =============================================================================
-# STEP 6 — Verification
+# STEP 6 — Persistent Monitor Channel (mon0)
 # =============================================================================
 echo ""
-echo "--- [6/6] Verification ---"
+echo "--- [6/7] Persistent Monitor Channel Configuration ---"
+
+sudo mkdir -p /etc/wifi-sniffer
+
+# Channel config — edit any time to change mon0's channel, or use the
+# mon0-set-channel helper below. Applied automatically on every reboot.
+# Skipped if it already exists so a re-run doesn't reset your chosen channel.
+if [ -f /etc/wifi-sniffer/mon0-channel.conf ]; then
+    echo "  /etc/wifi-sniffer/mon0-channel.conf already exists — leaving it untouched."
+else
+sudo tee /etc/wifi-sniffer/mon0-channel.conf > /dev/null <<'EOF'
+# mon0 monitor channel — applied at boot by wlan1-monitor-channel.service,
+# and any time via: sudo mon0-set-channel
+#
+# CHANNEL: plain iw channel number (2.4/5 GHz), e.g. 36, 40, 60, 149
+# FREQ:    frequency in MHz for 6 GHz channels (overrides CHANNEL if set),
+#          e.g. 5975, 6135, 6175, 6215 — pair with FREQ_WIDTH (default 20)
+CHANNEL=36
+#FREQ=
+#FREQ_WIDTH=20
+EOF
+    echo "  Created /etc/wifi-sniffer/mon0-channel.conf (default: channel 36)"
+fi
+
+# mon0-set-channel — applies the config above to mon0. The MT7921 driver
+# requires wlan1 to be down to change mon0's band/channel, so this brings
+# wlan1 down, applies the channel/frequency, then brings wlan1 back up.
+#
+# Usage:
+#   sudo mon0-set-channel                 # (re-)apply the channel from the conf file
+#   sudo mon0-set-channel 60              # update conf to channel 60 and apply it
+#   sudo mon0-set-channel freq 6135       # update conf to freq 6135 MHz (20 MHz width) and apply it
+#   sudo mon0-set-channel freq 6135 20    # same, with explicit bandwidth (MHz) as the 3rd arg
+sudo tee /usr/local/bin/mon0-set-channel > /dev/null <<'EOF'
+#!/bin/bash
+set -euo pipefail
+CONF=/etc/wifi-sniffer/mon0-channel.conf
+
+if [ "${1:-}" = "freq" ]; then
+    FREQ_ARG="${2:?Usage: mon0-set-channel freq <MHz> [bandwidth MHz, default 20]}"
+    WIDTH_ARG="${3:-20}"
+    sed -i -E "s/^#?CHANNEL=.*/#CHANNEL=/" "$CONF"
+    sed -i -E "s/^#?FREQ=.*/FREQ=$FREQ_ARG/" "$CONF"
+    sed -i -E "s/^#?FREQ_WIDTH=.*/FREQ_WIDTH=$WIDTH_ARG/" "$CONF"
+elif [ -n "${1:-}" ]; then
+    sed -i -E "s/^#?FREQ=.*/#FREQ=/" "$CONF"
+    sed -i -E "s/^#?CHANNEL=.*/CHANNEL=$1/" "$CONF"
+fi
+
+# shellcheck disable=SC1090
+source "$CONF"
+
+ip link set wlan1 down
+if [ -n "${FREQ:-}" ]; then
+    iw dev mon0 set freq "$FREQ" "${FREQ_WIDTH:-20}"
+    ip link set wlan1 up
+    echo "mon0 set to ${FREQ} MHz"
+elif [ -n "${CHANNEL:-}" ]; then
+    iw dev mon0 set channel "$CHANNEL"
+    ip link set wlan1 up
+    echo "mon0 set to channel ${CHANNEL}"
+else
+    ip link set wlan1 up
+    echo "No CHANNEL or FREQ configured in $CONF" >&2
+    exit 1
+fi
+EOF
+sudo chmod +x /usr/local/bin/mon0-set-channel
+
+# wlan1-monitor-channel.service — applies the configured channel every boot,
+# after mon0 has been created by wlan1-monitor.service.
+sudo tee /etc/systemd/system/wlan1-monitor-channel.service > /dev/null <<'EOF'
+[Unit]
+Description=Apply configured channel to mon0
+After=wlan1-monitor.service
+Requires=wlan1-monitor.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/mon0-set-channel
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable wlan1-monitor-channel
+echo "  wlan1-monitor-channel enabled — mon0 channel now persists across reboots."
+echo "  Change it any time: sudo mon0-set-channel <channel>   (e.g. sudo mon0-set-channel 60)"
+
+# =============================================================================
+# STEP 7 — Verification
+# =============================================================================
+echo ""
+echo "--- [7/7] Verification ---"
 echo ""
 
 PASS=0
@@ -466,6 +577,8 @@ check "wlan1 NM config present"           "test -f /etc/NetworkManager/conf.d/wl
 check "sudoers wifidump entry present"    "sudo test -f /etc/sudoers.d/wifidump"
 check "hostapd config present"            "test -f /etc/hostapd/hostapd-ap0.conf"
 check "dnsmasq AP config present"         "test -f /etc/dnsmasq-ap0.conf"
+check "wlan1-monitor-channel enabled"     "systemctl is-enabled wlan1-monitor-channel"
+check "mon0 channel config present"       "test -f /etc/wifi-sniffer/mon0-channel.conf"
 
 echo ""
 echo "  $PASS checks passed, $FAIL need attention."
@@ -484,8 +597,17 @@ echo "     sudo reboot"
 echo ""
 echo "  2. After reboot, plug in the Alfa adapter and verify:"
 echo "     iw dev           # should show wlan1 (managed) and mon0 (monitor)"
-echo "     systemctl status wlan1-monitor iperf2-tcp iperf2-udp iperf3"
+echo "     systemctl status wlan1-monitor wlan1-monitor-channel iperf2-tcp iperf2-udp iperf3"
 echo ""
 echo "  3. Edit the AP passphrase if needed:"
 echo "     sudo nano /etc/hostapd/hostapd-ap0.conf"
+echo ""
+echo "  4. Change mon0's channel any time (persists across reboots):"
+echo "     sudo mon0-set-channel 60              # 2.4/5 GHz channel"
+echo "     sudo mon0-set-channel freq 6135 20    # 6 GHz frequency (MHz), 20 = bandwidth (MHz)"
+echo "     Or edit /etc/wifi-sniffer/mon0-channel.conf directly, then:"
+echo "     sudo mon0-set-channel"
+echo ""
+echo " Re-running this script is safe — it repairs services/permissions and"
+echo " won't overwrite your hostapd/dnsmasq/channel customizations."
 echo ""
