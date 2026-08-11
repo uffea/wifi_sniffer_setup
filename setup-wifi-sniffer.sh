@@ -36,23 +36,86 @@ ok()   { echo "  [OK]    $*"; }
 # Trap unexpected exits and report the line number
 trap 'echo ""; echo "  [FATAL] Script exited unexpectedly at line $LINENO"; exit 1' ERR
 
+# Log everything to a file as well as the terminal. If the session drops with
+# no visible error (see the rpi-connect note below), the log on disk still
+# shows exactly how far the script got.
+LOG_FILE="$HOME/setup-wifi-sniffer-$(date +%Y%m%d-%H%M%S).log"
+exec > >(tee -a "$LOG_FILE") 2>&1
+
 echo ""
 echo "============================================================"
 echo " Wi-Fi Sniffer Setup"
 echo " Target user: $SCRIPT_USER"
+echo " Logging to:  $LOG_FILE"
 echo "============================================================"
 echo ""
+
+# Best-effort: is this shell itself running inside a Raspberry Pi Connect
+# remote shell? Advisory only — a miss just skips the extra warning below.
+running_via_rpi_connect() {
+    local pid=$$ ppid
+    for _ in 1 2 3 4 5 6 7 8; do
+        [ -z "$pid" ] || [ "$pid" -le 1 ] && return 1
+        if tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -qi 'rpi-connect'; then
+            return 0
+        fi
+        ppid=$(awk '/^PPid:/{print $2}' "/proc/$pid/status" 2>/dev/null)
+        [ -z "$ppid" ] && return 1
+        pid=$ppid
+    done
+    return 1
+}
+
+if running_via_rpi_connect; then
+    echo "  [NOTE]  This shell looks like a Raspberry Pi Connect remote shell."
+    echo "          Upgrading rpi-connect restarts the service that carries this"
+    echo "          session, which drops the connection with no error message —"
+    echo "          the script's own rpi-connect protection (below) covers that"
+    echo "          specific case, but any other service restart during a long"
+    echo "          apt run could still disconnect you. For extra safety, run this"
+    echo "          script inside 'tmux new -s setup' and reattach if it drops."
+    echo ""
+fi
 
 # =============================================================================
 # STEP 1 — System Update & Package Installation
 # =============================================================================
 echo "--- [1/7] System Update & Package Installation ---"
 
+# Hold rpi-connect back for the duration of the upgrade.
+#
+# Raspberry Pi's own troubleshooting docs confirm this: upgrading
+# rpi-connect/rpi-connect-lite restarts the Connect service mid-upgrade. If
+# this script is running inside a Connect remote shell, that restart kills
+# the shell — and this script — with no error message, because the session
+# dies with the service, not because of a script error. Holding the package
+# during 'full-upgrade' lets everything else upgrade normally without ending
+# the session it's running in; it's unheld again immediately below.
+CONNECT_PKGS=$(dpkg -l rpi-connect rpi-connect-lite 2>/dev/null | awk '/^ii/{print $2}')
+if [ -n "$CONNECT_PKGS" ]; then
+    # shellcheck disable=SC2086
+    sudo apt-mark hold $CONNECT_PKGS > /dev/null
+    ok "Held back $CONNECT_PKGS for this upgrade (its own upgrade restarts the service and can kill a Connect remote shell mid-script)"
+fi
+
 $APT update || die "apt update failed — check network connectivity"
 $APT full-upgrade -y \
   -o Dpkg::Options::="--force-confdef" \
   -o Dpkg::Options::="--force-confold" \
   || die "apt full-upgrade failed"
+
+if [ -n "$CONNECT_PKGS" ]; then
+    # shellcheck disable=SC2086
+    sudo apt-mark unhold $CONNECT_PKGS > /dev/null
+    echo "  [NOTE]  $CONNECT_PKGS was held back during the upgrade above so its"
+    echo "          own restart could not drop this session mid-script. It is not"
+    echo "          upgraded yet. Update it over a PLAIN SSH session — not this"
+    echo "          Connect remote shell — so a restart mid-upgrade cannot drop"
+    echo "          the very connection running the command:"
+    echo "            ssh $SCRIPT_USER@<rpi-ip>"
+    echo "            sudo apt update && sudo apt install --only-upgrade $CONNECT_PKGS"
+    echo "          If you must do it over Connect, wrap it: tmux new -s upgrade"
+fi
 
 # Pre-accept interactive prompts before installing packages
 echo "wireshark-common wireshark-common/install-setuid boolean true" \

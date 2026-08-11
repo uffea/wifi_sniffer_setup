@@ -194,11 +194,21 @@ chmod +x setup-wifi-sniffer.sh
 
 > The script will prompt for your `sudo` password at the start. During installation, accept any questions that appear (e.g. iperf3 daemon setup) by pressing **Enter** or selecting **Yes**.
 
+Everything the script prints is also written to `~/setup-wifi-sniffer-<timestamp>.log`, so if the session drops partway through (see the RPi Connect note below), the log on disk still shows exactly how far it got.
+
+> **Running over Raspberry Pi Connect?** Upgrading `rpi-connect` itself restarts the service that carries a Connect remote shell, which silently drops the connection — and this script — mid-upgrade. The script holds `rpi-connect`/`rpi-connect-lite` back for the duration of Step 1's `apt full-upgrade` and unholds them right after, specifically so this can't happen; it will tell you at the end how to update Connect separately over a plain SSH session. That protects against Connect's own restart, but a long `apt` run can restart other services too — for extra safety, run the script inside `tmux new -s setup` so you can reattach if anything drops it:
+>
+> ```bash
+> tmux new -s setup
+> ./setup-wifi-sniffer.sh
+> # if the connection drops: reconnect, then `tmux attach -t setup`
+> ```
+
 The script runs through 7 steps and prints progress as it goes:
 
 | Step | What it does |
 | ------ | ------------- |
-| 1 | System update, package install, `dumpcap` capabilities, `iw` wrapper, sudoers entry for wifidump |
+| 1 | System update, package install (holding back `rpi-connect` during the upgrade if installed), `dumpcap` capabilities, `iw` wrapper, sudoers entry for wifidump |
 | 2 | Enables NetworkManager's Wi-Fi radio (so `wlan0` can scan), excludes `wlan1` and `ap0` from NetworkManager and dhcpcd permanently |
 | 3 | Creates and enables the `wlan1-monitor` service (creates `mon0` at boot) |
 | 4 | Creates and enables `iperf2-tcp`, `iperf2-udp`, and `iperf3` as persistent services |
@@ -704,7 +714,7 @@ sudo mon0-set-channel 44          # or: sudo mon0-set-channel freq 6135
 
 ## 8. RPi Connect — Register Your Device (Optional)
 
-The RPi Connect service is already installed and running (enabled via Raspberry Pi Imager in Part 1, Section 2). 
+The RPi Connect service is already installed and running (enabled via Raspberry Pi Imager in Part 1, Section 2).
 
 ### 8.1 Activate Connect
 
