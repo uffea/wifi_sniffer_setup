@@ -108,7 +108,7 @@ if [ $ret -ne 0 ] && echo "$output" | grep -qE "resource busy|Invalid argument";
     # resource busy:     AP (ap0) owns the PHY channel — mon0 already on correct channel.
     # Invalid argument:  wifidump passed a 6 GHz frequency (MHz) as a channel number
     #                    (e.g. "set channel 6135"). Pre-set the frequency with
-    #                    'sudo iw dev mon0 set freq <MHz> HT20' before starting
+    #                    'sudo mon0-set-channel freq <MHz>' before starting
     #                    wifidump and enter the MHz value as the channel in Wireshark.
     exit 0
 fi
@@ -137,10 +137,35 @@ sudo visudo -c -f "$SUDOERS_FILE" > /dev/null \
 echo "  Step 1 done."
 
 # =============================================================================
-# STEP 2 — NetworkManager / dhcpcd: Exclude wlan1 and ap0
+# STEP 2 — NetworkManager / dhcpcd: Exclude wlan1 and ap0, enable the wlan0 radio
 # =============================================================================
 echo ""
 echo "--- [2/7] NetworkManager / dhcpcd — Excluding wlan1 and ap0 ---"
+
+# Enable NetworkManager's Wi-Fi radio switch.
+#
+# If Wi-Fi was not configured in Raspberry Pi Imager, Raspberry Pi OS leaves the
+# wireless radio disabled at first boot. NetworkManager then reports wlan0 as
+# "unavailable" and refuses to bring the link up, so it stays DOWN with
+# "qdisc noop" — and 'iw dev wlan0 scan' fails with "Network is down (-100)".
+# That breaks the wlan0 channel survey (Part 2, Section 7.1), which is the only
+# way to run an ACTIVE scan while mon0 owns the Alfa's radio.
+#
+# This is NM's own soft switch, independent of rfkill, and it persists in
+# /var/lib/NetworkManager/NetworkManager.state. Turning it on leaves wlan0
+# "disconnected" — radio up and scannable, not connected to anything. wlan1 is
+# unmanaged, so NM does not touch it either way.
+if command -v nmcli > /dev/null; then
+    if [ "$(nmcli -t radio wifi 2>/dev/null)" = "disabled" ]; then
+        sudo nmcli radio wifi on 2>/dev/null \
+            && ok "NetworkManager Wi-Fi radio enabled (wlan0 now scannable)" \
+            || warn "Could not enable the Wi-Fi radio — run: sudo nmcli radio wifi on"
+    else
+        ok "NetworkManager Wi-Fi radio already enabled"
+    fi
+else
+    warn "nmcli not found — cannot check the Wi-Fi radio switch"
+fi
 
 # Mark unmanaged via nmcli (may fail if adapter not plugged in yet — that's OK)
 sudo nmcli dev set wlan1 managed no 2>/dev/null || true
@@ -469,12 +494,18 @@ sudo tee /etc/wifi-sniffer/mon0-channel.conf > /dev/null <<'EOF'
 # mon0 monitor channel — applied at boot by wlan1-monitor-channel.service,
 # and any time via: sudo mon0-set-channel
 #
-# CHANNEL: plain iw channel number (2.4/5 GHz), e.g. 36, 40, 60, 149
-# FREQ:    frequency in MHz for 6 GHz channels (overrides CHANNEL if set),
-#          e.g. 5975, 6135, 6175, 6215 — pair with FREQ_WIDTH (default 20)
+# CHANNEL:     plain iw channel number (2.4/5 GHz), e.g. 6, 36, 60, 149
+# FREQ:        control frequency in MHz — required for 6 GHz; takes precedence
+#              over CHANNEL when both are set. e.g. 5975, 6135, 6175, 6215
+# FREQ_WIDTH:  channel width in MHz: 20 (default), 40, 80 or 160
+# FREQ_CENTRE: centre frequency in MHz — MANDATORY for widths above 20 MHz.
+#              iw refuses "set freq <f> 40" without it. mon0-set-channel
+#              derives it automatically for 5 and 6 GHz; set it by hand only
+#              for a non-standard block.
 CHANNEL=36
 #FREQ=
 #FREQ_WIDTH=20
+#FREQ_CENTRE=
 EOF
     echo "  Created /etc/wifi-sniffer/mon0-channel.conf (default: channel 36)"
 fi
@@ -484,43 +515,169 @@ fi
 # wlan1 down, applies the channel/frequency, then brings wlan1 back up.
 #
 # Usage:
-#   sudo mon0-set-channel                 # (re-)apply the channel from the conf file
-#   sudo mon0-set-channel 60              # update conf to channel 60 and apply it
-#   sudo mon0-set-channel freq 6135       # update conf to freq 6135 MHz (20 MHz width) and apply it
-#   sudo mon0-set-channel freq 6135 20    # same, with explicit bandwidth (MHz) as the 3rd arg
+#   sudo mon0-set-channel                        # (re-)apply the channel from the conf file
+#   sudo mon0-set-channel 36                     # channel 36 (2.4/5 GHz), stored + applied
+#   sudo mon0-set-channel freq 6135              # 6135 MHz, 20 MHz wide
+#   sudo mon0-set-channel freq 6135 40           # 40 MHz wide, centre derived automatically
+#   sudo mon0-set-channel freq 6135 40 6125      # explicit centre frequency
+#
+# NOTE: iw REQUIRES a centre frequency for any width above 20 MHz —
+# "iw dev mon0 set freq 6135 40" is a usage error, not a driver failure. The
+# helper derives the centre of the containing block for 5 and 6 GHz so the
+# 3-argument form works; pass a 4th argument only for a non-standard block.
 sudo tee /usr/local/bin/mon0-set-channel > /dev/null <<'EOF'
 #!/bin/bash
-set -euo pipefail
+# mon0-set-channel — set mon0's capture channel and persist it across reboots.
+set -uo pipefail
+
 CONF=/etc/wifi-sniffer/mon0-channel.conf
 
+# Call the real iw, NOT the /usr/local/bin/iw wrapper. The wrapper deliberately
+# swallows "Invalid argument" so wifidump keeps streaming; here that would hide
+# a genuine mistake and report success for a channel that was never set.
+IW=/usr/sbin/iw
+
+die() { echo "mon0-set-channel: $*" >&2; exit 1; }
+
+usage() {
+    cat >&2 <<'USAGE'
+Usage:
+  mon0-set-channel                               re-apply the channel from the conf file
+  mon0-set-channel <channel>                     2.4/5 GHz channel number (6, 36, 149 ...)
+  mon0-set-channel freq <MHz>                    control frequency, 20 MHz wide (use for 6 GHz)
+  mon0-set-channel freq <MHz> <width>            width 20|40|80|160, centre derived automatically
+  mon0-set-channel freq <MHz> <width> <centre>   explicit centre frequency in MHz
+
+iw requires a centre frequency for any width above 20 MHz. It is derived for
+5 and 6 GHz, so the 4th argument is only needed for a non-standard block.
+USAGE
+    exit 1
+}
+
+is_num() { [[ $1 =~ ^[0-9]+$ ]]; }
+
+# Centre of the <width> MHz block containing control frequency <freq>.
+# Blocks are aligned to the bottom of the band: 5170 MHz for 5 GHz (so ch36+40
+# -> 5190) and 5945 MHz for 6 GHz (so 6135 at 40 MHz -> 6125).
+derive_centre() {
+    local f=$1 w=$2 base
+    if   (( f >= 5945 && f <= 7125 )); then base=5945
+    elif (( f >= 5170 && f <= 5895 )); then base=5170
+    else
+        die "cannot derive a centre frequency for ${f} MHz — pass it as the 4th argument"
+    fi
+    echo $(( base + ((f - base) / w) * w + w / 2 ))
+}
+
+# ------------------------------------------------------------ parse arguments
+MODE=""; NEW_CHANNEL=""; NEW_FREQ=""; NEW_WIDTH=""; NEW_CENTRE=""
+
+case "${1:-}" in
+    -h|--help|help) usage ;;
+esac
+
 if [ "${1:-}" = "freq" ]; then
-    FREQ_ARG="${2:?Usage: mon0-set-channel freq <MHz> [bandwidth MHz, default 20]}"
-    WIDTH_ARG="${3:-20}"
-    sed -i -E "s/^#?CHANNEL=.*/#CHANNEL=/" "$CONF"
-    sed -i -E "s/^#?FREQ=.*/FREQ=$FREQ_ARG/" "$CONF"
-    sed -i -E "s/^#?FREQ_WIDTH=.*/FREQ_WIDTH=$WIDTH_ARG/" "$CONF"
+    MODE=freq
+    NEW_FREQ=${2:-}; NEW_WIDTH=${3:-20}; NEW_CENTRE=${4:-}
+    is_num "$NEW_FREQ"  || usage
+    is_num "$NEW_WIDTH" || usage
+    case "$NEW_WIDTH" in
+        20)
+            NEW_CENTRE="" ;;
+        40|80|160)
+            if [ -n "$NEW_CENTRE" ]; then
+                is_num "$NEW_CENTRE" || usage
+            else
+                NEW_CENTRE=$(derive_centre "$NEW_FREQ" "$NEW_WIDTH") || exit 1
+            fi ;;
+        *)
+            die "width must be 20, 40, 80 or 160 (got $NEW_WIDTH)" ;;
+    esac
 elif [ -n "${1:-}" ]; then
-    sed -i -E "s/^#?FREQ=.*/#FREQ=/" "$CONF"
-    sed -i -E "s/^#?CHANNEL=.*/CHANNEL=$1/" "$CONF"
+    is_num "$1" || usage
+    MODE=channel; NEW_CHANNEL=$1
 fi
 
+# ------------------------------------------------- persist before applying
+# Arguments are fully validated above, so the conf file can never be left
+# holding a combination that fails on every subsequent run.
+if [ -n "$MODE" ]; then
+    TMP=$(mktemp) || die "mktemp failed"
+    {
+        cat <<'HDR'
+# mon0 monitor channel — applied at boot by wlan1-monitor-channel.service,
+# and any time via: sudo mon0-set-channel
+#
+# CHANNEL:     plain iw channel number (2.4/5 GHz), e.g. 6, 36, 60, 149
+# FREQ:        control frequency in MHz — required for 6 GHz; takes precedence
+#              over CHANNEL when both are set. e.g. 5975, 6135, 6175, 6215
+# FREQ_WIDTH:  channel width in MHz: 20 (default), 40, 80 or 160
+# FREQ_CENTRE: centre frequency in MHz — MANDATORY for widths above 20 MHz.
+#              iw refuses "set freq <f> 40" without it. mon0-set-channel
+#              derives it automatically for 5 and 6 GHz.
+HDR
+        if [ "$MODE" = freq ]; then
+            echo "#CHANNEL="
+            echo "FREQ=$NEW_FREQ"
+            echo "FREQ_WIDTH=$NEW_WIDTH"
+            if [ -n "$NEW_CENTRE" ]; then echo "FREQ_CENTRE=$NEW_CENTRE"; else echo "#FREQ_CENTRE="; fi
+        else
+            echo "CHANNEL=$NEW_CHANNEL"
+            echo "#FREQ="
+            echo "#FREQ_WIDTH=20"
+            echo "#FREQ_CENTRE="
+        fi
+    } > "$TMP"
+    install -m 644 "$TMP" "$CONF" || die "could not write $CONF"
+    rm -f "$TMP"
+fi
+
+# ------------------------------------------------------------------- apply
+[ -r "$CONF" ] || die "$CONF not found — re-run setup-wifi-sniffer.sh"
 # shellcheck disable=SC1090
 source "$CONF"
 
+CHANNEL=${CHANNEL:-}
+FREQ=${FREQ:-}
+FREQ_WIDTH=${FREQ_WIDTH:-20}
+FREQ_CENTRE=${FREQ_CENTRE:-}
+
+# Back-compat: conf files written before FREQ_CENTRE existed.
+if [ -n "$FREQ" ] && [ "$FREQ_WIDTH" != 20 ] && [ -z "$FREQ_CENTRE" ]; then
+    FREQ_CENTRE=$(derive_centre "$FREQ" "$FREQ_WIDTH") || exit 1
+fi
+
+$IW dev mon0 info > /dev/null 2>&1 \
+    || die "mon0 does not exist — sudo systemctl start wlan1-monitor"
+
+# The MT7921 driver refuses a cross-band change while the managed wlan1 is UP,
+# so wlan1 goes down for the switch. The trap guarantees it comes back up even
+# if iw fails — otherwise a rejected argument would strand wlan1 down and take
+# the AP and any managed use of the adapter with it.
+restore_wlan1() { ip link set wlan1 up 2> /dev/null || true; }
+trap restore_wlan1 EXIT
 ip link set wlan1 down
-if [ -n "${FREQ:-}" ]; then
-    iw dev mon0 set freq "$FREQ" "${FREQ_WIDTH:-20}"
-    ip link set wlan1 up
-    echo "mon0 set to ${FREQ} MHz"
-elif [ -n "${CHANNEL:-}" ]; then
-    iw dev mon0 set channel "$CHANNEL"
-    ip link set wlan1 up
+
+if [ -n "$FREQ" ]; then
+    if [ -n "$FREQ_CENTRE" ]; then
+        $IW dev mon0 set freq "$FREQ" "$FREQ_WIDTH" "$FREQ_CENTRE" \
+            || die "iw rejected: set freq $FREQ $FREQ_WIDTH $FREQ_CENTRE"
+        echo "mon0 set to ${FREQ} MHz, ${FREQ_WIDTH} MHz wide (centre ${FREQ_CENTRE} MHz)"
+    else
+        $IW dev mon0 set freq "$FREQ" "$FREQ_WIDTH" \
+            || die "iw rejected: set freq $FREQ $FREQ_WIDTH"
+        echo "mon0 set to ${FREQ} MHz, ${FREQ_WIDTH} MHz wide"
+    fi
+elif [ -n "$CHANNEL" ]; then
+    $IW dev mon0 set channel "$CHANNEL" \
+        || die "iw rejected: set channel $CHANNEL"
     echo "mon0 set to channel ${CHANNEL}"
 else
-    ip link set wlan1 up
-    echo "No CHANNEL or FREQ configured in $CONF" >&2
-    exit 1
+    die "no CHANNEL or FREQ configured in $CONF"
 fi
+
+# Read back what the driver actually accepted
+$IW dev mon0 info | grep -E "^[[:space:]]*(channel|center)" | sed 's/^[[:space:]]*/  /'
 EOF
 sudo chmod +x /usr/local/bin/mon0-set-channel
 
@@ -574,6 +731,7 @@ check "iperf2-udp service enabled"        "systemctl is-enabled iperf2-udp"
 check "iperf3 service enabled"            "systemctl is-enabled iperf3"
 check "dumpcap setcap applied"            "getcap /usr/bin/dumpcap | grep -q cap_net_raw"
 check "wlan1 NM config present"           "test -f /etc/NetworkManager/conf.d/wlan1-unmanaged.conf"
+check "NM Wi-Fi radio enabled (wlan0)"    "[ \"\$(nmcli -t radio wifi)\" = enabled ]"
 check "sudoers wifidump entry present"    "sudo test -f /etc/sudoers.d/wifidump"
 check "hostapd config present"            "test -f /etc/hostapd/hostapd-ap0.conf"
 check "dnsmasq AP config present"         "test -f /etc/dnsmasq-ap0.conf"
@@ -603,8 +761,10 @@ echo "  3. Edit the AP passphrase if needed:"
 echo "     sudo nano /etc/hostapd/hostapd-ap0.conf"
 echo ""
 echo "  4. Change mon0's channel any time (persists across reboots):"
-echo "     sudo mon0-set-channel 60              # 2.4/5 GHz channel"
-echo "     sudo mon0-set-channel freq 6135 20    # 6 GHz frequency (MHz), 20 = bandwidth (MHz)"
+echo "     sudo mon0-set-channel 60             # 2.4/5 GHz channel number"
+echo "     sudo mon0-set-channel freq 6135      # 6 GHz, MHz, 20 MHz wide"
+echo "     sudo mon0-set-channel freq 6135 40   # 40 MHz wide, centre derived"
+echo "     sudo mon0-set-channel --help         # all forms"
 echo "     Or edit /etc/wifi-sniffer/mon0-channel.conf directly, then:"
 echo "     sudo mon0-set-channel"
 echo ""

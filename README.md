@@ -2,7 +2,7 @@
 
 **Hardware:** Raspberry Pi 5 (4 GB or 8 GB) · Alfa AWUS036AXML (MT7921AUN, Wi-Fi 6E)  
 **OS:** Raspberry Pi OS (64-bit)  
-**Document version:** June 2026
+**Document version:** August 2026
 
 ---
 
@@ -15,6 +15,7 @@
 3. [First Boot & Connection](#3-first-boot--connection)
 4. [Run the Setup Script](#4-run-the-setup-script)
 5. [Verify the Setup](#5-verify-the-setup)
+6. [Set the Capture Channel](#6-set-the-capture-channel) — `mon0-set-channel`
 
 ### Usage Guide
 
@@ -160,7 +161,7 @@ ping -c 4 8.8.8.8
 
 ## 4. Run the Setup Script
 
-All remaining build steps are automated by `setup-wifi-sniffer.sh`. The script handles package installation, Wireshark permissions, NetworkManager configuration, the `wlan1-monitor` systemd service, iperf persistent services, and AP mode pre-configuration.
+All remaining build steps are automated by `setup-wifi-sniffer.sh`. The script handles package installation, Wireshark permissions, NetworkManager configuration, the `wlan1-monitor` systemd service, the persistent capture channel, iperf persistent services, and AP mode pre-configuration.
 
 ### 4.1 Get the Script onto the RPi5
 
@@ -193,16 +194,17 @@ chmod +x setup-wifi-sniffer.sh
 
 > The script will prompt for your `sudo` password at the start. During installation, accept any questions that appear (e.g. iperf3 daemon setup) by pressing **Enter** or selecting **Yes**.
 
-The script runs through 6 steps and prints progress as it goes:
+The script runs through 7 steps and prints progress as it goes:
 
 | Step | What it does |
 | ------ | ------------- |
-| 1 | System update, package install, `dumpcap` capabilities, sudoers entry for wifidump |
-| 2 | Excludes `wlan1` from NetworkManager permanently |
+| 1 | System update, package install, `dumpcap` capabilities, `iw` wrapper, sudoers entry for wifidump |
+| 2 | Enables NetworkManager's Wi-Fi radio (so `wlan0` can scan), excludes `wlan1` and `ap0` from NetworkManager and dhcpcd permanently |
 | 3 | Creates and enables the `wlan1-monitor` service (creates `mon0` at boot) |
 | 4 | Creates and enables `iperf2-tcp`, `iperf2-udp`, and `iperf3` as persistent services |
-| 5 | Writes `hostapd` and `dnsmasq` config files for AP mode (AP not started) |
-| 6 | Runs a verification checklist and prints pass/fail for each component |
+| 5 | Writes `hostapd` and `dnsmasq` config files plus the `ap-enable` / `ap-disable` helpers (AP not started) |
+| 6 | Installs `mon0-set-channel` and the `wlan1-monitor-channel` service so the capture channel persists across reboots (default: channel 36) |
+| 7 | Runs a verification checklist and prints pass/fail for each component |
 
 **Interface assignment after the script completes:**
 
@@ -227,11 +229,11 @@ Required for the `wireshark` group membership to take effect.
 After the reboot in Section 4.3, run these checks to confirm everything is working:
 
 ```bash
-# Should show wlan0, wlan1 (managed), and mon0 (monitor)
+# Should show wlan0, wlan1 (managed), and mon0 (monitor) on channel 36
 iw dev
 
-# Should show active (exited)
-systemctl status wlan1-monitor
+# Both should show active (exited)
+systemctl status wlan1-monitor wlan1-monitor-channel
 
 # Should show active (running)
 systemctl status iperf2-tcp iperf2-udp iperf3
@@ -240,10 +242,57 @@ systemctl status iperf2-tcp iperf2-udp iperf3
 If any service is not active, try restarting it:
 
 ```bash
-sudo systemctl restart wlan1-monitor
+sudo systemctl restart wlan1-monitor wlan1-monitor-channel
 ```
 
-> **Once all checks pass**, the RPi5 is ready to use. Proceed to Part 2 for capture and testing workflows.
+> **Once all checks pass**, the RPi5 is ready to use. Section 6 below covers changing the capture channel; Part 2 covers the capture and testing workflows.
+
+---
+
+## 6. Set the Capture Channel
+
+`mon0` comes up on the channel stored in `/etc/wifi-sniffer/mon0-channel.conf` (default: **channel 36**). The `wlan1-monitor-channel` service applies that file on every boot, so the channel survives reboots and adapter re-plugs — you only need to change it when you want to capture somewhere else.
+
+Use the `mon0-set-channel` helper for every channel change:
+
+```bash
+sudo mon0-set-channel 36              # 5 GHz  — channel number
+sudo mon0-set-channel 6               # 2.4 GHz — channel number
+sudo mon0-set-channel freq 6135       # 6 GHz  — control frequency in MHz, 20 MHz wide
+sudo mon0-set-channel freq 6135 40    # 40 MHz wide — centre frequency derived for you
+sudo mon0-set-channel                 # re-apply whatever is already in the conf file
+sudo mon0-set-channel --help           # all forms
+```
+
+The helper writes your choice into the conf file **and** applies it immediately, so the new channel is live now *and* after the next reboot. 
+
+### 6.1 6 GHz Needs a Frequency, Not a Channel Number
+
+`iw` resolves a plain channel number to 5 GHz — `set channel 37` gives you 5 GHz channel 37, not 6 GHz. For 6 GHz always use the `freq` form with the frequency in MHz.
+
+| 6 GHz channel | Frequency (MHz) |
+| --------------- | ----------------- |
+| 1 | 5975 |
+| 37 | 6135 |
+| 45 | 6175 |
+| 53 | 6215 |
+
+These are the preferred scanning channels (PSCs) — the ones 6 GHz clients probe first, so they are the most productive channels to sit on.
+
+> **20 MHz bandwidth is the right default for sniffing.** A wider capture interface does not show you more frames — it only changes how the radio reports the channel, and on a busy band it costs sensitivity. Use 20 MHz unless you are specifically investigating wide-channel behaviour.
+
+> **Regulatory domain:** 5 GHz and 6 GHz need a country code set. If a channel is rejected, run `sudo raspi-config nonint do_wifi_country SE` (substitute your own code) and reboot.
+
+### 6.2 Editing the Config File Directly
+
+Equivalent to using the helper with an argument — useful if you prefer to see all the settings at once:
+
+```bash
+sudo nano /etc/wifi-sniffer/mon0-channel.conf
+sudo mon0-set-channel                 # apply the edit
+```
+
+`CHANNEL` is a plain channel number; `FREQ` is a control frequency in MHz and takes precedence over `CHANNEL` when both are set. Comment one out to use the other. `FREQ_WIDTH` defaults to 20; if you set it higher, also set `FREQ_CENTRE` — or just use the helper, which fills it in.
 
 ---
 
@@ -287,48 +336,40 @@ If it is missing:
    - **Remote SSH username:** the username from the image
    - **Remote SSH password:** the password from the image
    - **Remote interface:** `mon0`
-   - **Channel / frequency:** set as required
+   - **Channel / frequency:** a channel number within the band `mon0` is already on. To move to a different band, pre-set it with `sudo mon0-set-channel` first (Part 1, Section 6) — wifidump cannot do a cross-band switch itself.
 4. Click **Start**.
 
 wifidump connects over SSH, sets the channel on `mon0`, and streams frames live into Wireshark. Since `mon0` is already in monitor mode via the systemd service set up in Part 1, Section 4, wifidump will find it ready and proceed without needing to reconfigure it.
 
 ### 2.1 6 GHz Capture
 
-wifidump passes the channel field directly to `iw set channel`, which always resolves to 5 GHz when given a plain number like 37. 6 GHz requires a different approach.
+wifidump passes its channel field straight to `iw set channel`, which always resolves a plain number like 37 to 5 GHz. So for 6 GHz, set the frequency on the RPi first and let wifidump's own channel step fail harmlessly.
 
-The MT7921 driver does not allow cross-band switches while a managed VIF (`wlan1`) is UP — even when `wlan1` is not connected to anything. Any move between bands (2.4 ↔ 5 ↔ 6 GHz) must be done with `wlan1` down.
-
-**Step 1 — Pre-set `mon0` to the 6 GHz frequency on the RPi:**
+**Step 1 — Pre-set `mon0` on the RPi** (see Part 1, Section 6):
 
 ```bash
-sudo ip link set wlan1 down
-sudo iw dev mon0 set freq 6135 20
-sudo ip link set wlan1 up
+sudo mon0-set-channel freq 6135
 ```
 
-**Step 2 — Start wifidump** and enter the frequency in MHz in the channel field (e.g. `6135` for 6 GHz channel 37). The channel-set step inside wifidump will fail silently (invalid channel number), leaving `mon0` on the frequency you pre-set.
+**Step 2 — Start wifidump** and enter the same frequency in MHz in the channel field (e.g. `6135`). wifidump's channel-set step fails silently on the invalid channel number, leaving `mon0` exactly where you pre-set it.
 
-Common 6 GHz preferred scanning channel frequencies: 5975, 6135, 6175, 6215 MHz.
-
-**Switching back to 2.4 or 5 GHz** after a 6 GHz session requires the same `wlan1 down/up` sequence:
+**Switching back to 2.4 or 5 GHz** afterwards is a single command — no interface juggling needed:
 
 ```bash
-sudo ip link set wlan1 down
-sudo iw dev mon0 set channel 36      # 5 GHz example; or set freq 2437 for 2.4 GHz ch6
-sudo ip link set wlan1 up
+sudo mon0-set-channel 36              # 5 GHz channel 36
 ```
 
 ---
 
 ## 3. Local Capture on the RPi5 -- Advanced
 
-All capture on the RPi5 is done via `tshark` over SSH. `mon0` is already in monitor mode — no setup needed. Set the desired channel with `sudo iw dev mon0 set channel <ch>`, then capture to a `.pcapng` file and retrieve it to your Windows machine for analysis in Wireshark.
+All capture on the RPi5 is done via `tshark` over SSH. `mon0` is already in monitor mode — no setup needed. Set the desired channel with `sudo mon0-set-channel` (Part 1, Section 6), then capture to a `.pcapng` file and retrieve it to your Windows machine for analysis in Wireshark.
 
 ### 3.1 Capture to File
 
 ```bash
 # Set channel, then capture to a timestamped file
-sudo iw dev mon0 set channel 36
+sudo mon0-set-channel 36
 tshark -i mon0 -w ~/capture_$(date +%Y%m%d_%H%M).pcapng
 ```
 
@@ -503,7 +544,7 @@ wlan0 (built-in RPi5)
 sudo ap-enable
 ```
 
-This creates the `ap0` VIF, assigns IP `192.168.99.1`, starts hostapd and dnsmasq, enables NAT, and tunes `mon0` to the AP channel. Verify with:
+This creates the `ap0` VIF, assigns IP `192.168.99.1`, starts hostapd and dnsmasq, and enables NAT. `mon0` follows the AP onto its channel automatically — the MT7921 is a single-radio adapter, so both VIFs share one channel. While the AP is running, `mon0-set-channel` cannot move `mon0` independently; change `channel=` in `/etc/hostapd/hostapd-ap0.conf` and restart the AP instead. Verify with:
 
 ```bash
 iw dev   # should show wlan1, mon0, and ap0
@@ -566,7 +607,7 @@ For throughput testing where payload content matters, an open AP (no WPA2) gives
 sudo ap-disable
 ```
 
-`mon0` remains in place and capture continues working normally after the AP is stopped.
+`mon0` remains in place and capture continues working normally after the AP is stopped. It stays on the AP's channel — run `sudo mon0-set-channel` to put it back on your configured channel.
 
 > **Troubleshooting — disable monitor mode temporarily:** To free up the radio entirely (e.g. to use `wlan1` as a regular managed client):
 >
@@ -575,7 +616,11 @@ sudo ap-disable
 > sudo iw dev mon0 del
 > ```
 >
-> To restore: `sudo systemctl start wlan1-monitor`
+> To restore, start both services so `mon0` is recreated *and* put back on its configured channel:
+>
+> ```bash
+> sudo systemctl start wlan1-monitor wlan1-monitor-channel
+> ```
 
 ---
 
@@ -617,6 +662,8 @@ sudo airodump-ng -c 6 mon0
 sudo airodump-ng -c 36 mon0
 ```
 
+> `airodump-ng` sets the channel itself, but it hits the same driver limitation as `iw`: it cannot move `mon0` to a different band while `wlan1` is UP. If a `-c` or `--band` option produces no frames, put `mon0` on that band first with `sudo mon0-set-channel` (Part 1, Section 6), then start `airodump-ng`.
+
 The columns to watch:
 
 | Column | Meaning |
@@ -647,15 +694,21 @@ The columns to watch:
 - Excellent choice for clean baseline measurements.
 - Requires client devices that support 6 GHz.
 
-Compare total frame counts across channels to identify the quietest one.
+Compare total frame counts across channels to identify the quietest one, then make it the standing capture channel:
+
+```bash
+sudo mon0-set-channel 44          # or: sudo mon0-set-channel freq 6135
+```
 
 ---
 
 ## 8. RPi Connect — Register Your Device (Optional)
 
-The RPi Connect service is already installed and running (enabled via Raspberry Pi Imager in Part 1, Section 2). To link it to your Raspberry Pi account:
+The RPi Connect service is already installed and running (enabled via Raspberry Pi Imager in Part 1, Section 2). 
 
 ### 8.1 Activate Connect
+
+This is already done if it was included when the SD Image was created.
 
 ```bash
 systemctl --user start rpi-connect
@@ -701,13 +754,18 @@ sudo ip link set wlan1 up/down              # Bring base interface up/down
 # === MONITOR INTERFACE (persistent via systemd — see Part 1, Section 4) ===
 sudo systemctl start wlan1-monitor          # Create mon0 (normally auto at boot)
 sudo systemctl stop wlan1-monitor           # Remove mon0
-sudo iw dev mon0 set channel 36             # Set capture channel (2.4 / 5 GHz)
-sudo iw dev mon0 set freq 5180             # Set capture channel by frequency (5 GHz)
+iw dev mon0 info                            # Show mon0's current channel / frequency
 
-# === 6 GHz CAPTURE (cross-band switch requires wlan1 down) ===
-sudo ip link set wlan1 down
-sudo iw dev mon0 set freq 6135 20          # ch37 = 6135 MHz, 20 MHz width
-sudo ip link set wlan1 up
+# === CAPTURE CHANNEL (persists across reboots — see Part 1, Section 6) ===
+sudo mon0-set-channel 6                     # 2.4 GHz channel 6
+sudo mon0-set-channel 36                    # 5 GHz channel 36
+sudo mon0-set-channel freq 6135             # 6 GHz — MHz, 20 MHz wide (ch37)
+sudo mon0-set-channel freq 6135 40          # 40 MHz wide — centre derived (6125)
+sudo mon0-set-channel freq 6135 40 6125     # 40 MHz wide — explicit centre
+sudo mon0-set-channel                       # Re-apply the configured channel
+sudo mon0-set-channel --help                # All forms
+# Widths >20 MHz REQUIRE a centre frequency — iw rejects "set freq 6135 40"
+# Config file: /etc/wifi-sniffer/mon0-channel.conf
 
 # === CAPTURE ===
 tshark -i mon0 -w cap.pcapng               # Capture to file
@@ -740,4 +798,5 @@ sudo airodump-ng -c 36 mon0               # Lock to channel 36
 rpi-connect signin                          # Link device to your account
 rpi-connect status                          # Check status
 rpi-connect signout                         # Unlink account
-# Access via: https://connect.raspberry
+# Access via: https://connect.raspberrypi.com
+```

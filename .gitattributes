@@ -1,0 +1,13 @@
+# Keep LF line endings in the working tree on every platform.
+#
+# setup-wifi-sniffer.sh runs on Raspberry Pi OS. A CRLF copy fails immediately
+# with "bad interpreter: /bin/bash^M" when transferred with scp, and every
+# heredoc inside it would write stray CR bytes into the files it generates
+# (/usr/local/bin/mon0-set-channel, ap-enable, the systemd units, hostapd.conf).
+# Fetching over curl from raw.githubusercontent.com always worked because git
+# stores LF; this makes the checked-out copy match.
+* text=auto eol=lf
+
+# Belt and braces for the files that are executed on the Pi.
+*.sh text eol=lf
+*.md text eol=lf
