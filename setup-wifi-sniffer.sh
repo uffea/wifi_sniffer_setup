@@ -180,21 +180,26 @@ exit $ret
 IWEOF
 sudo chmod +x /usr/local/bin/iw
 
-# sudoers drop-in for wifidump extcap — allows the plugin to run iw/ip/dumpcap
+# sudoers drop-in for wifidump extcap — allows the plugin to run iw/ip/dumpcap/tcpdump
 # over SSH without a password prompt.
 # Lists /usr/local/bin/iw (the wrapper) so 'sudo iw' is permitted without a
 # password. Scripts that call /usr/sbin/iw directly (ap-enable, wlan1-monitor)
 # run as root via sudo and are unaffected.
+# tcpdump is listed alongside dumpcap: dumpcap+setcap already lets any user
+# capture without sudo, so this NOPASSWD entry only matters if something here
+# invokes 'sudo tcpdump' directly instead.
 IP_PATH=$(command -v ip 2>/dev/null || { [ -x /usr/sbin/ip ] && echo /usr/sbin/ip; } || true)
+TCPDUMP_PATH=$(command -v tcpdump 2>/dev/null || { [ -x /usr/bin/tcpdump ] && echo /usr/bin/tcpdump; } || true)
 # DUMPCAP_PATH already resolved above
 [ -z "$IP_PATH" ] && die "ip not found"
+[ -z "$TCPDUMP_PATH" ] && die "tcpdump not found — package installation may have failed"
 SUDOERS_FILE="/etc/sudoers.d/wifidump"
-echo "$SCRIPT_USER ALL=(ALL) NOPASSWD: $IP_PATH, /usr/local/bin/iw, $DUMPCAP_PATH, /usr/local/bin/mon0-set-channel" \
+echo "$SCRIPT_USER ALL=(ALL) NOPASSWD: $IP_PATH, /usr/local/bin/iw, $DUMPCAP_PATH, $TCPDUMP_PATH, /usr/local/bin/mon0-set-channel" \
   | sudo tee "$SUDOERS_FILE" > /dev/null
 sudo chmod 440 "$SUDOERS_FILE"
 # Validate the file — sudo will ignore sudoers.d files with syntax errors
 sudo visudo -c -f "$SUDOERS_FILE" > /dev/null \
-  && echo "  Created $SUDOERS_FILE (/usr/local/bin/iw, $IP_PATH, $DUMPCAP_PATH, /usr/local/bin/mon0-set-channel)" \
+  && echo "  Created $SUDOERS_FILE (/usr/local/bin/iw, $IP_PATH, $DUMPCAP_PATH, $TCPDUMP_PATH, /usr/local/bin/mon0-set-channel)" \
   || echo "  WARNING: $SUDOERS_FILE failed visudo check — check paths manually"
 
 echo "  Step 1 done."
@@ -796,6 +801,7 @@ check "dumpcap setcap applied"            "getcap /usr/bin/dumpcap | grep -q cap
 check "wlan1 NM config present"           "test -f /etc/NetworkManager/conf.d/wlan1-unmanaged.conf"
 check "NM Wi-Fi radio enabled (wlan0)"    "[ \"\$(nmcli -t radio wifi)\" = enabled ]"
 check "sudoers wifidump entry present"    "sudo test -f /etc/sudoers.d/wifidump"
+check "sudoers tcpdump entry present"     "sudo grep -q tcpdump /etc/sudoers.d/wifidump"
 check "hostapd config present"            "test -f /etc/hostapd/hostapd-ap0.conf"
 check "dnsmasq AP config present"         "test -f /etc/dnsmasq-ap0.conf"
 check "wlan1-monitor-channel enabled"     "systemctl is-enabled wlan1-monitor-channel"
