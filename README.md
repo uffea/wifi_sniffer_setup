@@ -320,7 +320,16 @@ sudo mon0-set-channel                 # apply the edit
 4. Complete the installation.
 
 **Ensure OpenSSH Client is installed on Windows:**  
-Settings → System → Optional Features → search for "OpenSSH Client" → Install if not present. This is required by `wifidump` to connect to the RPi5.
+`wifidump` needs the Windows OpenSSH client to reach the RPi5. Use either method:
+
+- **GUI:** Settings → System → Optional Features → search for "OpenSSH Client" → Install if not present.
+- **PowerShell, as Administrator:**
+
+```powershell
+Add-WindowsCapability -Online -Name OpenSSH.Client~~~~0.0.1.0
+```
+
+> To get an elevated shell: Start → type "PowerShell" → **Run as Administrator**, and approve the UAC prompt.
 
 **Verify wifidump is present:**  
 Open Wireshark and look for **"Wi-Fi remote capture"** in the interface list on the start screen. If it appears, wifidump is installed and ready.
@@ -328,6 +337,38 @@ Open Wireshark and look for **"Wi-Fi remote capture"** in the interface list on 
 If it is missing:
 
 - Re-run the Wireshark installer → **Modify** → **Choose Components → Extcap Plugins** → ensure **Wifidump** is checked.
+
+### 1.1 Create the SSH Config Files libssh Expects
+
+Even with the OpenSSH client installed, Wireshark may fail to connect to the RPi5 — or print errors while connecting — because the SSH library it bundles (`libssh`) looks for two config files that a fresh Windows install does not have:
+
+| File | Scope | Create from |
+|---|---|---|
+| `C:\ProgramData\ssh\ssh_known_hosts` | system-wide host keys | Administrator PowerShell |
+| `C:\Users\<you>\.ssh\config` | per-user client options | regular PowerShell |
+
+Both must exist as **files**, not just folders, and neither filename has an extension. Empty files are enough — libssh only needs to be able to open them.
+
+**In the Administrator PowerShell:**
+
+```powershell
+New-Item -ItemType Directory -Path "C:\ProgramData\ssh" -Force
+New-Item -ItemType File -Path "C:\ProgramData\ssh\ssh_known_hosts"
+```
+
+**Then in a regular PowerShell (not Admin!)**, if Wireshark reports a missing home-directory config file:
+
+```powershell
+New-Item -ItemType File -Path "$HOME\.ssh\config"
+```
+
+If one of the files already exists, PowerShell says so and leaves its contents alone.
+
+Do not create these in File Explorer or save them from Notepad — Windows appends `.txt`, and libssh will not find `config.txt`. Check that the names came out clean:
+
+```powershell
+Get-ChildItem "$HOME\.ssh", "C:\ProgramData\ssh" | Select-Object FullName
+```
 
 ---
 
@@ -367,6 +408,35 @@ sudo mon0-set-channel freq 6135
 
 ```bash
 sudo mon0-set-channel 36              # 5 GHz channel 36
+```
+
+### 2.2 Harmless Messages When You Press Stop
+
+Pressing **Stop** on a wifidump capture normally prints a burst of SSH errors. These are teardown noise, not a failed capture — the packets were already collected:
+
+```
+ssh_strict_fopen: Failed to open a file C:\Users\<you>/.ssh/config for reading: No such file or directory
+ssh_strict_fopen: Failed to open a file C:/ProgramData/ssh/ssh_known_hosts for reading: No such file or directory
+ssh_socket_exception_callback: Socket exception callback: 2 (10054)
+ssh_client_connection_callback: Socket error: connection reset by peer
+Error reading from channel
+```
+
+| Message | Cause |
+|---|---|
+| `ssh_strict_fopen: ... .ssh/config` | The per-user client config is missing — create it as in Section 1.1. |
+| `ssh_strict_fopen: ... ssh_known_hosts` | The system-wide host-key file is missing — create it as in Section 1.1. |
+| `Socket exception ... 2 (10054)`, `connection reset by peer`, `Error reading from channel` | **This is the Stop itself.** Wireshark closes the SSH channel while `dumpcap` on the RPi5 is still writing into it, and Windows reports the abrupt close as `WSAECONNRESET`. Expected on every stop — creating the config files does not remove these. |
+
+So the two files from Section 1.1 silence the first two lines, and the socket-reset lines can be ignored. If the packet list filled up before you pressed Stop, the capture worked.
+
+> **Authentication method makes no difference to these messages.** Switching from a password to an SSH key or certificate changes how *you* prove your identity, while the `config` and `known_hosts` reads happen during host verification — a separate phase that runs either way. An SSH host *certificate* does not replace `known_hosts` either: the `@cert-authority` line that trusts the CA lives in that same file.
+
+**If a stop leaves a capture process running on the RPi5**, it holds `mon0` and the next wifidump run fails. Check for a stale process and clear it:
+
+```bash
+pgrep -a dumpcap; pgrep -a tcpdump
+sudo pkill dumpcap        # only if a stale process is listed
 ```
 
 ---
