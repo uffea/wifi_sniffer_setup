@@ -27,7 +27,8 @@
 6. [AP Mode + Simultaneous Capture](#6-ap-mode--simultaneous-capture)
 7. [Channel Scan & Survey](#7-channel-scan--survey)
 8. [RPi Connect — Register Your Device (Optional)](#8-rpi-connect--register-your-device-optional)
-9. [Quick-Reference Cheat Sheet](#9-quick-reference-cheat-sheet)
+9. [Connect via a Direct Ethernet Cable (No Router)](#9-connect-via-a-direct-ethernet-cable-no-router)
+10. [Quick-Reference Cheat Sheet](#10-quick-reference-cheat-sheet)
 
 ---
 
@@ -204,17 +205,18 @@ Everything the script prints is also written to `~/setup-wifi-sniffer-<timestamp
 > # if the connection drops: reconnect, then `tmux attach -t setup`
 > ```
 
-The script runs through 7 steps and prints progress as it goes:
+The script runs through 8 steps and prints progress as it goes:
 
 | Step | What it does |
 | ------ | ------------- |
 | 1 | System update, package install (holding back `rpi-connect` during the upgrade if installed), `dumpcap` capabilities, `iw` wrapper, sudoers entry for wifidump |
 | 2 | Enables NetworkManager's Wi-Fi radio (so `wlan0` can scan), excludes `wlan1` and `ap0` from NetworkManager and dhcpcd permanently |
-| 3 | Creates and enables the `wlan1-monitor` service (creates `mon0` at boot) |
-| 4 | Creates and enables `iperf2-tcp`, `iperf2-udp`, and `iperf3` as persistent services |
-| 5 | Writes `hostapd` and `dnsmasq` config files plus the `ap-enable` / `ap-disable` helpers (AP not started) |
-| 6 | Installs `mon0-set-channel` and the `wlan1-monitor-channel` service so the capture channel persists across reboots (default: channel 36) |
-| 7 | Runs a verification checklist and prints pass/fail for each component |
+| 3 | Adds the `eth0-direct` fallback connection and dnsmasq/dispatcher config so `eth0` gets a fixed IP when no router is present — see Usage Guide [Section 9](#9-connect-via-a-direct-ethernet-cable-no-router) |
+| 4 | Creates and enables the `wlan1-monitor` service (creates `mon0` at boot) |
+| 5 | Creates and enables `iperf2-tcp`, `iperf2-udp`, and `iperf3` as persistent services |
+| 6 | Writes `hostapd` and `dnsmasq` config files plus the `ap-enable` / `ap-disable` helpers (AP not started) |
+| 7 | Installs `mon0-set-channel` and the `wlan1-monitor-channel` service so the capture channel persists across reboots (default: channel 36) |
+| 8 | Runs a verification checklist and prints pass/fail for each component |
 
 **Interface assignment after the script completes:**
 
@@ -782,6 +784,30 @@ sudo mon0-set-channel 44          # or: sudo mon0-set-channel freq 6135
 
 ---
 
+## 9. Connect via a Direct Ethernet Cable (No Router)
+
+> This requires the setup script (Part 1, Section 4) to have already run once — the very first setup still needs internet access (via Ethernet to a router, or Wi-Fi) to install packages. Once set up, this lets you plug the RPi5 straight into your computer's Ethernet port for later access — in the field, on a bench, anywhere without a router handy.
+
+The setup script leaves `eth0`'s normal DHCP behaviour untouched, and adds a fallback connection profile with a **fixed** address (`eth0-direct`) that only ever gets activated explicitly — never by NetworkManager on its own. At boot, and any time the cable is unplugged and replugged, the RPi5 waits to see whether `eth0` gets a normal DHCP address (as it would plugged into a router); if nothing answers within about 30 seconds, it falls back to:
+
+```text
+192.168.50.1
+```
+
+While that fallback is active, the RPi5 also runs its own DHCP server on `eth0`, so your computer gets an address automatically (in `192.168.50.50`–`192.168.50.150`) — no manual network configuration needed on your end. Just:
+
+1. Plug an Ethernet cable directly from your computer to the RPi5.
+2. Wait about 30 seconds for the fallback to kick in.
+3. SSH in using the fixed address:
+
+```bash
+ssh <username>@192.168.50.1
+```
+
+> This address is only used when nothing else answers DHCP on `eth0`. Plug the RPi5 into a router again and it goes back to getting an address from that router as normal.
+
+---
+
 ## 8. RPi Connect — Register Your Device (Optional)
 
 The RPi Connect service is already installed and running (enabled via Raspberry Pi Imager in Part 1, Section 2).
@@ -823,7 +849,7 @@ systemctl --user stop rpi-connect
 
 ---
 
-## 9. Quick-Reference Cheat Sheet
+## 10. Quick-Reference Cheat Sheet
 
 ```bash
 # === INTERFACE MANAGEMENT ===
@@ -868,6 +894,10 @@ iperf3 -c <ip> -P 4 --bidir               # 4 parallel bidirectional
 sudo ap-enable                              # Start AP (ap0, 192.168.99.1, DHCP)
 sudo ap-disable                             # Stop AP and remove ap0
 # Edit AP config: sudo nano /etc/hostapd/hostapd-ap0.conf
+
+# === DIRECT ETHERNET (no router — see Part 2, Section 9) ===
+ssh <username>@192.168.50.1                 # Fixed fallback address, DHCP served to your PC
+nmcli -f NAME,DEVICE,STATE connection show  # Check whether eth0-direct or the DHCP profile is active
 
 # === CHANNEL SCAN ===
 sudo airodump-ng mon0                       # Passive all-band scan (visual)

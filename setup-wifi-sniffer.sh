@@ -80,7 +80,7 @@ fi
 # =============================================================================
 # STEP 1 — System Update & Package Installation
 # =============================================================================
-echo "--- [1/7] System Update & Package Installation ---"
+echo "--- [1/8] System Update & Package Installation ---"
 
 # Hold rpi-connect back for the duration of the upgrade.
 #
@@ -208,7 +208,7 @@ echo "  Step 1 done."
 # STEP 2 — NetworkManager / dhcpcd: Exclude wlan1 and ap0, enable the wlan0 radio
 # =============================================================================
 echo ""
-echo "--- [2/7] NetworkManager / dhcpcd — Excluding wlan1 and ap0 ---"
+echo "--- [2/8] NetworkManager / dhcpcd — Excluding wlan1 and ap0 ---"
 
 # Enable NetworkManager's Wi-Fi radio switch.
 #
@@ -260,10 +260,200 @@ if [ -f /etc/dhcpcd.conf ]; then
 fi
 
 # =============================================================================
-# STEP 3 — wlan1-monitor Systemd Service (creates mon0 at boot)
+# STEP 3 — Direct Ethernet Fallback (eth0 gets a fixed IP when no router/DHCP
+# server is present, and hands out addresses itself so a directly-connected
+# PC gets one automatically)
 # =============================================================================
 echo ""
-echo "--- [3/7] Monitor Mode Service (wlan1-monitor) ---"
+echo "--- [3/8] Direct Ethernet Fallback (eth0) ---"
+
+# This never touches eth0's normal DHCP profile — the one NetworkManager
+# created automatically on first boot, and the one this script's own SSH
+# session is very possibly running over right now. An earlier version of
+# this step tried to manage that profile directly (a second competing NM
+# connection profile, priority-ordered fallback, disabling/re-enabling
+# autoconnect on it) and that turned out fragile in practice: once the
+# static fallback won a race even once, it could get "stuck", permanently
+# blocking normal DHCP from ever being retried — even with a real router
+# present. Repair that now if an earlier run left it in that state.
+CURRENT_ETH0_CONN=$(nmcli -g GENERAL.CONNECTION device show eth0 2>/dev/null)
+if [ -n "$CURRENT_ETH0_CONN" ] && [ "$CURRENT_ETH0_CONN" != "eth0-direct" ]; then
+    sudo nmcli connection modify "$CURRENT_ETH0_CONN" connection.autoconnect yes 2>/dev/null
+fi
+if nmcli -t -f NAME connection show 2>/dev/null | grep -qx "eth0-dhcp"; then
+    if [ "$CURRENT_ETH0_CONN" = "eth0-dhcp" ]; then
+        # Currently active (this session may well be running over it) —
+        # deleting it would tear down the interface immediately. Just stop
+        # it from being chosen again; it'll no longer be active after the
+        # next reboot/replug, at which point a future run of this script
+        # can remove it outright.
+        sudo nmcli connection modify eth0-dhcp connection.autoconnect no 2>/dev/null
+        warn "eth0-dhcp is currently active — disabled its autoconnect but left it in place until it's no longer in use (re-run this script later to remove it)"
+    else
+        sudo nmcli connection delete eth0-dhcp > /dev/null 2>&1
+        ok "Removed the old eth0-dhcp connection profile (superseded by the approach below)"
+    fi
+fi
+
+# eth0-direct: a manual/static connection profile with autoconnect explicitly
+# OFF, so NetworkManager itself never activates it — it's only ever brought
+# up by the carrier-triggered script below, never as a side effect of NM's
+# own autoconnect/priority logic. That keeps eth0's normal DHCP behavior
+# (whatever profile NetworkManager already manages it with) completely
+# untouched: this feature can only ever ADD a fallback, never interfere with
+# a real router being present.
+#
+# ipv4.never-default keeps it from ever becoming the default route (it has
+# no gateway, so it never should be).
+ETH0_DIRECT_IP="192.168.50.1"
+if nmcli -t -f NAME connection show 2>/dev/null | grep -qx "eth0-direct"; then
+    ok "eth0-direct fallback connection already exists"
+else
+    sudo nmcli connection add type ethernet ifname eth0 con-name eth0-direct \
+        autoconnect no \
+        ipv4.method manual ipv4.addresses "${ETH0_DIRECT_IP}/24" ipv4.never-default yes \
+        ipv6.method ignore \
+        > /dev/null \
+      && ok "Created eth0-direct fallback connection (${ETH0_DIRECT_IP}, activated only when nothing else answers DHCP within 30s)" \
+      || warn "Could not create eth0-direct NetworkManager connection"
+fi
+
+# dnsmasq config for directly-connected PCs (192.168.50.x) — only ever
+# started on eth0 while the eth0-direct profile above is the active one.
+# No default-gateway option is advertised: eth0-direct never carries a
+# default route, so telling clients otherwise would just break their
+# routing without giving them working internet through it.
+if [ -f /etc/dnsmasq-eth0-direct.conf ]; then
+    echo "  /etc/dnsmasq-eth0-direct.conf already exists — leaving your customizations intact."
+else
+sudo tee /etc/dnsmasq-eth0-direct.conf > /dev/null <<'EOF'
+interface=eth0
+bind-interfaces
+dhcp-range=192.168.50.50,192.168.50.150,255.255.255.0,24h
+EOF
+fi
+
+# Clean up the udev-triggered carrier detector from an earlier version of
+# this step. It turned out unreliable: the "change" uevent with an updated
+# carrier attribute that it depended on isn't guaranteed to fire for every
+# Ethernet driver — NetworkManager itself learns carrier state straight from
+# the kernel over rtnetlink, not udev, which is exactly why plain DHCP kept
+# working fine through all of this while the fallback never triggered at
+# all on a direct connection. Polling below replaces it with something that
+# only depends on reading sysfs, which always works.
+if [ -f /etc/udev/rules.d/99-eth0-direct.rules ] || [ -f /etc/systemd/system/eth0-direct-carrier@.service ]; then
+    sudo systemctl stop 'eth0-direct-carrier@*' 2>/dev/null || true
+    sudo rm -f /etc/udev/rules.d/99-eth0-direct.rules /etc/systemd/system/eth0-direct-carrier@.service /usr/local/bin/eth0-direct-carrier
+    sudo udevadm control --reload
+    ok "Removed the old udev-triggered carrier detector (replaced by eth0-direct-monitor below)"
+fi
+
+# eth0-direct-monitor — explicitly decides whether eth0-direct is needed,
+# instead of leaving that decision to NetworkManager's own autoconnect
+# ordering (the fragile part of an earlier approach) or to a udev uevent
+# that isn't guaranteed to fire (the fragile part of the one after that).
+# Run every 5s by the timer below, it only ever reads sysfs/ip/nmcli state —
+# nothing here depends on an event actually being delivered.
+#
+# No carrier: make sure eth0-direct is down and forget how long we've been
+# waiting. Carrier, and eth0 already has a real IPv4 address: nothing to do
+# (DHCP is working). Carrier, no address yet, and eth0-direct isn't already
+# active: start (or continue) a 30s countdown recorded in /run, and only
+# activate eth0-direct once that elapses — so a DHCP negotiation that's
+# simply running a little slow (a busy first boot, a slow router) isn't
+# mistaken for "no DHCP server present".
+sudo tee /usr/local/bin/eth0-direct-monitor > /dev/null <<'EOF'
+#!/bin/bash
+STATE_FILE=/run/eth0-direct-waiting-since
+
+CARRIER=$(cat /sys/class/net/eth0/carrier 2>/dev/null || echo 0)
+if [ "$CARRIER" != "1" ]; then
+    rm -f "$STATE_FILE"
+    if [ "$(nmcli -g GENERAL.CONNECTION device show eth0 2>/dev/null)" = "eth0-direct" ]; then
+        nmcli connection down eth0-direct 2>/dev/null
+    fi
+    exit 0
+fi
+
+if ip -4 -o addr show dev eth0 scope global 2>/dev/null | grep -q .; then
+    rm -f "$STATE_FILE"
+    exit 0
+fi
+
+[ "$(nmcli -g GENERAL.CONNECTION device show eth0 2>/dev/null)" = "eth0-direct" ] && exit 0
+
+NOW=$(date +%s)
+if [ ! -f "$STATE_FILE" ]; then
+    echo "$NOW" > "$STATE_FILE"
+    exit 0
+fi
+SINCE=$(cat "$STATE_FILE" 2>/dev/null || echo "$NOW")
+if [ $(( NOW - SINCE )) -ge 30 ]; then
+    nmcli connection up eth0-direct 2>/dev/null
+fi
+EOF
+sudo chmod +x /usr/local/bin/eth0-direct-monitor
+
+sudo tee /etc/systemd/system/eth0-direct-monitor.service > /dev/null <<'EOF'
+[Unit]
+Description=Decide whether eth0-direct's fixed address is needed
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/eth0-direct-monitor
+EOF
+
+sudo tee /etc/systemd/system/eth0-direct-monitor.timer > /dev/null <<'EOF'
+[Unit]
+Description=Run eth0-direct-monitor every 5s
+
+[Timer]
+OnBootSec=5s
+OnUnitActiveSec=5s
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now eth0-direct-monitor.timer
+
+# NetworkManager dispatcher script — starts/stops the dnsmasq instance above
+# to match eth0's active connection. Runs on every eth0 up/down event,
+# including when eth0-direct-monitor above activates/deactivates eth0-direct.
+sudo tee /etc/NetworkManager/dispatcher.d/90-eth0-direct > /dev/null <<'EOF'
+#!/bin/bash
+IFACE=$1
+ACTION=$2
+[ "$IFACE" = "eth0" ] || exit 0
+
+stop_dnsmasq() { pkill -f "dnsmasq-eth0-direct" 2>/dev/null || true; }
+
+case "$ACTION" in
+    up)
+        CONN=$(nmcli -g GENERAL.CONNECTION device show eth0 2>/dev/null)
+        stop_dnsmasq
+        if [ "$CONN" = "eth0-direct" ]; then
+            /usr/sbin/dnsmasq -C /etc/dnsmasq-eth0-direct.conf \
+                --pid-file=/run/dnsmasq-eth0-direct.pid
+        fi
+        ;;
+    down)
+        stop_dnsmasq
+        ;;
+esac
+EOF
+sudo chmod +x /etc/NetworkManager/dispatcher.d/90-eth0-direct
+ok "eth0-direct dnsmasq dispatcher installed (hands out ${ETH0_DIRECT_IP%.*}.x addresses when eth0-direct is active)"
+
+echo "  Direct Ethernet fallback ready: ${ETH0_DIRECT_IP} when no router/DHCP server answers on eth0."
+
+# =============================================================================
+# STEP 4 — wlan1-monitor Systemd Service (creates mon0 at boot)
+# =============================================================================
+echo ""
+echo "--- [4/8] Monitor Mode Service (wlan1-monitor) ---"
 
 sudo tee /etc/systemd/system/wlan1-monitor.service > /dev/null <<'EOF'
 [Unit]
@@ -289,10 +479,10 @@ sudo systemctl enable wlan1-monitor
 echo "  wlan1-monitor enabled (starts when Alfa adapter is plugged in)."
 
 # =============================================================================
-# STEP 4 — iperf Persistent Services
+# STEP 5 — iperf Persistent Services
 # =============================================================================
 echo ""
-echo "--- [4/7] iperf Persistent Services ---"
+echo "--- [5/8] iperf Persistent Services ---"
 
 # iperf2 TCP — port 5001, Zephyr zperf compatible
 sudo tee /etc/systemd/system/iperf2-tcp.service > /dev/null <<'EOF'
@@ -341,10 +531,10 @@ sudo systemctl enable iperf2-tcp iperf2-udp iperf3
 echo "  iperf2-tcp, iperf2-udp, iperf3 enabled."
 
 # =============================================================================
-# STEP 5 — AP Mode Pre-configuration (hostapd + dnsmasq)
+# STEP 6 — AP Mode Pre-configuration (hostapd + dnsmasq)
 # =============================================================================
 echo ""
-echo "--- [5/7] AP Mode Pre-configuration ---"
+echo "--- [6/8] AP Mode Pre-configuration ---"
 
 sudo mkdir -p /etc/hostapd
 
@@ -545,10 +735,10 @@ sudo chmod +x /usr/local/bin/ap-disable
 echo "  ap-enable and ap-disable installed to /usr/local/bin/"
 
 # =============================================================================
-# STEP 6 — Persistent Monitor Channel (mon0)
+# STEP 7 — Persistent Monitor Channel (mon0)
 # =============================================================================
 echo ""
-echo "--- [6/7] Persistent Monitor Channel Configuration ---"
+echo "--- [7/8] Persistent Monitor Channel Configuration ---"
 
 sudo mkdir -p /etc/wifi-sniffer
 
@@ -772,10 +962,10 @@ echo "  wlan1-monitor-channel enabled — mon0 channel now persists across reboo
 echo "  Change it any time: sudo mon0-set-channel <channel>   (e.g. sudo mon0-set-channel 60)"
 
 # =============================================================================
-# STEP 7 — Verification
+# STEP 8 — Verification
 # =============================================================================
 echo ""
-echo "--- [7/7] Verification ---"
+echo "--- [8/8] Verification ---"
 echo ""
 
 PASS=0
@@ -793,6 +983,10 @@ check() {
   fi
 }
 
+check "eth0-direct dnsmasq config present"      "test -f /etc/dnsmasq-eth0-direct.conf"
+check "eth0-direct dispatcher script present"   "test -x /etc/NetworkManager/dispatcher.d/90-eth0-direct"
+check "eth0-direct-monitor helper present"      "test -x /usr/local/bin/eth0-direct-monitor"
+check "eth0-direct-monitor timer enabled"       "systemctl is-enabled eth0-direct-monitor.timer"
 check "wlan1-monitor service enabled"     "systemctl is-enabled wlan1-monitor"
 check "iperf2-tcp service enabled"        "systemctl is-enabled iperf2-tcp"
 check "iperf2-udp service enabled"        "systemctl is-enabled iperf2-udp"
@@ -836,6 +1030,12 @@ echo "     sudo mon0-set-channel freq 6135 40   # 40 MHz wide, centre derived"
 echo "     sudo mon0-set-channel --help         # all forms"
 echo "     Or edit /etc/wifi-sniffer/mon0-channel.conf directly, then:"
 echo "     sudo mon0-set-channel"
+echo ""
+echo "  5. To connect later with just an Ethernet cable (no router): plug it"
+echo "     straight into your PC's Ethernet port. If no DHCP server answers"
+echo "     within ~30s, the Pi falls back to a fixed address and hands your"
+echo "     PC an address itself — connect with:"
+echo "       ssh $SCRIPT_USER@192.168.50.1"
 echo ""
 echo " Re-running this script is safe — it repairs services/permissions and"
 echo " won't overwrite your hostapd/dnsmasq/channel customizations."
