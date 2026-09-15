@@ -320,16 +320,29 @@ fi
 
 # dnsmasq config for directly-connected PCs (192.168.50.x) — only ever
 # started on eth0 while the eth0-direct profile above is the active one.
-# No default-gateway option is advertised: eth0-direct never carries a
-# default route, so telling clients otherwise would just break their
-# routing without giving them working internet through it.
-if [ -f /etc/dnsmasq-eth0-direct.conf ]; then
+# No default-gateway or DNS-server option is advertised: eth0-direct never
+# carries a default route, so telling clients otherwise would just hijack
+# their default route into a dead end and cut off their real internet
+# access (Windows in particular prefers a wired link over Wi-Fi by default,
+# metric 25 vs 30, so it would send ALL traffic, not just LAN traffic, into
+# this link). port=0 turns off dnsmasq's own DNS forwarder entirely — this
+# is a DHCP-only helper, not a resolver — and the two empty dhcp-option
+# lines explicitly suppress the router/DNS options dnsmasq would otherwise
+# add automatically (defaulting to itself for both) once dhcp-range makes
+# it act as a DHCP server.
+if [ -f /etc/dnsmasq-eth0-direct.conf ] && grep -q "^dhcp-option=option:router" /etc/dnsmasq-eth0-direct.conf 2>/dev/null; then
     echo "  /etc/dnsmasq-eth0-direct.conf already exists — leaving your customizations intact."
 else
+    if [ -f /etc/dnsmasq-eth0-direct.conf ]; then
+        warn "Rewriting /etc/dnsmasq-eth0-direct.conf — the version an earlier run of this script generated didn't suppress the router/DNS options, so it could silently hijack a directly-connected PC's default route and cut off its real internet access"
+    fi
 sudo tee /etc/dnsmasq-eth0-direct.conf > /dev/null <<'EOF'
 interface=eth0
 bind-interfaces
+port=0
 dhcp-range=192.168.50.50,192.168.50.150,255.255.255.0,24h
+dhcp-option=option:router
+dhcp-option=option:dns-server
 EOF
 fi
 
