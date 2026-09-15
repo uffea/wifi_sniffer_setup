@@ -784,7 +784,7 @@ sudo mon0-set-channel 44          # or: sudo mon0-set-channel freq 6135
 
 ---
 
-## 9. Connect via a Direct Ethernet Cable (No Router)
+## 8. Connect via a Direct Ethernet Cable (No Router)
 
 > This requires the setup script (Part 1, Section 4) to have already run once — the very first setup still needs internet access (via Ethernet to a router, or Wi-Fi) to install packages. Once set up, this lets you plug the RPi5 straight into your computer's Ethernet port for later access — in the field, on a bench, anywhere without a router handy.
 
@@ -808,11 +808,11 @@ ssh <username>@192.168.50.1
 
 ---
 
-## 8. RPi Connect — Register Your Device (Optional)
+## 9. RPi Connect — Register Your Device (Optional)
 
 The RPi Connect service is already installed and running (enabled via Raspberry Pi Imager in Part 1, Section 2).
 
-### 8.1 Activate Connect
+### 9.1 Activate Connect
 
 This is already done if it was included when the SD Image was created.
 
@@ -825,7 +825,7 @@ This outputs a URL — open it in any browser, log in with your Raspberry Pi acc
 
 > For Raspberry Pi Connect to work, the RPi5 must have internet access — either via Ethernet or via the Wi-Fi credentials configured during OS install.
 
-### 8.2 Access Your Pi Remotely
+### 9.2 Access Your Pi Remotely
 
 1. Go to **<https://connect.raspberrypi.com>** in any browser.
 2. Sign in with your Raspberry Pi account.
@@ -834,13 +834,13 @@ This outputs a URL — open it in any browser, log in with your Raspberry Pi acc
 
 > **Screen sharing** requires the Desktop version of Raspberry Pi OS. Lite (headless) only supports **Remote shell**.
 
-### 8.3 Check Connection Status
+### 9.3 Check Connection Status
 
 ```bash
 rpi-connect status
 ```
 
-### 8.4 Disable / Sign Out
+### 9.4 Disable / Sign Out
 
 ```bash
 rpi-connect signout
