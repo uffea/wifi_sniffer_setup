@@ -389,28 +389,42 @@ Get-ChildItem "$HOME\.ssh", "C:\ProgramData\ssh" | Select-Object FullName
    - **Remote SSH username:** the username from the image
    - **Remote SSH password:** the password from the image
    - **Remote interface:** `mon0`
-   - **Channel / frequency:** a channel number within the band `mon0` is already on. To move to a different band, pre-set it with `sudo mon0-set-channel` first (Part 1, Section 6) — wifidump cannot do a cross-band switch itself.
+   - **Remote channel:** pick any 2.4 / 5 / 6 GHz channel from the list.
+   - **Remote channel width:** 20, 40, 80 or 160 MHz (see 2.1).
 4. Click **Start**.
 
-wifidump connects over SSH, sets the channel on `mon0`, and streams frames live into Wireshark. Since `mon0` is already in monitor mode via the systemd service set up in Part 1, Section 4, wifidump will find it ready and proceed without needing to reconfigure it.
+wifidump connects over SSH, sets the channel and width on `mon0` (any band — the `iw` wrapper from the setup script takes care of the cross-band switch), and streams frames live into Wireshark. Since `mon0` is already in monitor mode via the systemd service set up in Part 1, Section 4, wifidump will find it ready and proceed without needing to reconfigure it.
 
-### 2.1 6 GHz Capture
+### 2.1 Channel Width
 
-wifidump passes its channel field straight to `iw set channel`, which always resolves a plain number like 37 to 5 GHz. So for 6 GHz, set the frequency on the RPi first and let wifidump's own channel step fail harmlessly.
+wifidump sends the chosen channel and width to the RPi5 as `iw dev mon0 set freq <MHz> <width> [<centre>]`; the wrapper applies it on every band, including 6 GHz, with no pre-setting over SSH. Check what the radio actually accepted with `iw dev mon0 info`. **20 MHz is the default and the fallback:** if no width is sent, the width is not 40/80/160, the driver rejects it, or it accepts it but the radio does not really switch (the wrapper reads it back), the capture runs on 20 MHz instead of failing.
 
-**Step 1 — Pre-set `mon0` on the RPi** (see Part 1, Section 6):
+Which width to choose:
+
+- **20 MHz** — management frames, association/EAPOL, connection debugging. Best sensitivity.
+- **Match the AP's width (40/80/160)** for data traffic such as iperf. A 20 MHz capture only sees the primary 20 MHz of a wide frame, so most data frames are missed. Measured against an 80 MHz network over 15 s: ~600 frames (1 data frame) at 20 MHz versus ~2300-2900 frames (180-280 data frames) at 80 MHz.
+- Set the **primary channel** to the AP's primary channel so your block lines up with the AP's. The AP's width is in the HT/VHT/HE Operation elements of its beacon.
+
+> `sudo mon0-set-channel` still sets the default channel applied at boot. While `ap0` is running, `mon0` follows the AP's channel and the wrapper leaves `wlan1` alone.
+
+#### Optional: choose the channel over SSH instead
+
+You do not have to use the Wireshark dropdown. If you prefer to set the channel on the RPi5 yourself (for example a width or centre frequency the dropdown does not offer, or a channel you want to keep for a long session), do it over SSH — see Part 1, Section 6 for all `mon0-set-channel` forms:
 
 ```bash
-sudo mon0-set-channel freq 6135
+sudo mon0-set-channel freq 6135 80        # any band; width and centre derived
+sudo touch /etc/wifi-sniffer/keep-channel # lock: ignore wifidump's channel/width
 ```
 
-**Step 2 — Start wifidump** and enter the same frequency in MHz in the channel field (e.g. `6135`). wifidump's channel-set step fails silently on the invalid channel number, leaving `mon0` exactly where you pre-set it.
+wifidump always sends the channel shown in its dialog when a capture starts, which would overwrite what you set over SSH. The `keep-channel` file tells the `iw` wrapper to ignore those requests, so the capture runs on the channel you chose. In the Wireshark dialog, the channel and width fields are then only cosmetic.
 
-**Switching back to 2.4 or 5 GHz** afterwards is a single command — no interface juggling needed:
+Back to the Wireshark dropdown:
 
 ```bash
-sudo mon0-set-channel 36              # 5 GHz channel 36
+sudo rm /etc/wifi-sniffer/keep-channel
 ```
+
+> With `wlan1` up (after `mon0-set-channel`), `iw dev mon0 info` may not print a channel line. The confirmation printed by `mon0-set-channel` itself shows what was applied.
 
 ### 2.2 Harmless Messages When You Press Stop
 
@@ -439,6 +453,47 @@ So the two files from Section 1.1 silence the first two lines, and the socket-re
 ```bash
 pgrep -a dumpcap; pgrep -a tcpdump
 sudo pkill dumpcap        # only if a stale process is listed
+```
+
+### 2.3 "Access denied" After Changing the Capture Settings
+
+After you change the channel or width in the gear dialog and press **Start**, the capture sometimes fails to connect at all:
+
+```
+ssh_strict_fopen: Failed to open a file /Users/<you>/.ssh/config for reading: No such file or directory
+ssh_strict_fopen: Failed to open a file /etc/ssh/ssh_known_hosts for reading: No such file or directory
+ssh_userauth_publickey_auto: Access denied: Tried every public key, none matched
+Error creating connection.
+Can't find a valid authentication. Disconnecting
+```
+
+The paths differ by OS (the example is macOS; Windows shows the paths from Section 1.1), but the cause is the same. The two `ssh_strict_fopen` lines are the harmless missing-file messages from Section 2.2. The real failure is the next line: none of the credentials wifidump offered were accepted by the RPi5. The fix depends on how you log in.
+
+**Password login:** the **Remote SSH password** field is often cleared when the dialog is reopened and saved, even though the other fields keep their values, so libssh falls back to trying your SSH keys. Open the gear dialog again, type the password back into **Remote SSH password**, and press **Start**. If that does not help, go through the dialog again, checking the address, username, and interface (`mon0`), then start once more.
+
+**SSH key login:** the key setup has gone stale. Usually the key pair no longer matches what the RPi5 has in `authorized_keys`, or the saved host key no longer matches (for example after re-flashing the SD card). Remove the key files and the saved host entries, then set them up again. Use a dedicated key for the sniffer so that deleting it does not break your other SSH logins:
+
+```bash
+# Remove the old key pair and the saved host keys for the RPi5
+rm -f ~/.ssh/wifi_sniffer ~/.ssh/wifi_sniffer.pub
+ssh-keygen -R wifi-sniffer.local
+ssh-keygen -R <rpi-ip>
+
+# Create a new key and install it on the RPi5 (asks for the RPi5 password once)
+ssh-keygen -t ed25519 -f ~/.ssh/wifi_sniffer
+ssh-copy-id -i ~/.ssh/wifi_sniffer.pub <username>@wifi-sniffer.local
+
+# Log in once by hand: accept the host key, and confirm no password is asked
+ssh -i ~/.ssh/wifi_sniffer <username>@wifi-sniffer.local
+```
+
+Then open the gear dialog, set **Path to SSH private key** to `~/.ssh/wifi_sniffer` again (plus **SSH key passphrase** if you gave the key one), leave the password field empty, and press **Start**. On Windows, where `ssh-copy-id` is not available, append the contents of `wifi_sniffer.pub` to `~/.ssh/authorized_keys` on the RPi5 instead.
+
+To silence the two `ssh_strict_fopen` lines on macOS or Linux, create the files libssh looks for:
+
+```bash
+touch ~/.ssh/config
+sudo touch /etc/ssh/ssh_known_hosts
 ```
 
 ---

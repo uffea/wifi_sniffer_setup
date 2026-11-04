@@ -153,26 +153,83 @@ DUMPCAP_PATH=$(command -v dumpcap 2>/dev/null \
 sudo setcap cap_net_raw,cap_net_admin=eip "$DUMPCAP_PATH" \
   || die "setcap on dumpcap failed"
 
-# /usr/local/bin/iw — iw wrapper that suppresses EBUSY ("resource busy").
+# /usr/local/bin/iw — iw wrapper used by wifidump.
 #
-# When wifidump calls 'sudo iw dev mon0 set channel X' while the AP (ap0) is
-# running, iw exits non-zero with "command failed: Device or resource busy".
-# That error text gets piped to Wireshark instead of pcapng data, causing the
-# "magic = 0x6d6d6f63" error. The fix: intercept 'sudo iw' via a wrapper at
-# /usr/local/bin/iw — sudo's secure_path puts /usr/local/bin before /usr/sbin,
-# so 'sudo iw' resolves to this wrapper rather than the real binary.
-# EBUSY is safe to ignore: ap0 already owns the PHY channel, and mon0 follows
-# it automatically. All other errors are passed through unchanged.
+# wifidump runs 'sudo iw dev mon0 set freq <MHz> <width> [<centre>]' for the
+# channel and width picked in Wireshark. The wrapper applies it on any band
+# (taking wlan1 down first, which the MT7921 needs for a cross-band change) and
+# keeps stdout empty — error text on stdout would be piped into the pcapng
+# stream ("magic = 0x6d6d6f63"). Other iw calls pass through, with EBUSY and
+# "Invalid argument" swallowed. sudo's secure_path puts /usr/local/bin before
+# /usr/sbin, so 'sudo iw' resolves to this wrapper rather than the real binary.
 sudo tee /usr/local/bin/iw > /dev/null <<'IWEOF'
 #!/bin/bash
-output=$(/usr/sbin/iw "$@" 2>&1)
+# /usr/local/bin/iw — wrapper used by wifidump (via 'sudo iw').
+#
+# 1. 'iw dev mon0 set freq <MHz> [20|40|80|160 [<centre>]]' (what wifidump sends
+#    for the channel / width chosen in Wireshark) is applied on ANY band.
+#    The MT7921 driver refuses a cross-band change while wlan1 is UP, so wlan1
+#    is taken down first. mon0 is a separate VIF and keeps capturing.
+#    - centre: taken from wifidump when given, otherwise derived here.
+#    - 20 MHz is the default: no width given, an unknown width, a width the driver
+#      rejects, or one it accepts without applying all end up on 20 MHz so the
+#      capture still starts (check with 'iw dev mon0 info').
+#    - Prints nothing: any text on stdout lands inside the pcapng stream and
+#      shows up in Wireshark as "magic = 0x6d6d6f63".
+# 2. Optional: while /etc/wifi-sniffer/keep-channel exists, wifidump's channel and
+#    width requests are ignored, so a channel set over SSH with
+#    'sudo mon0-set-channel' stays in place for the whole capture.
+# 3. Every other call goes to the real iw. EBUSY ("resource busy") and
+#    "Invalid argument" are swallowed for the same stdout reason.
+IW=/usr/sbin/iw
+KEEP=/etc/wifi-sniffer/keep-channel
+
+# Centre frequency of the <width> MHz block containing control frequency <freq>.
+centre() {
+    local f=$1 w=$2 base
+    if   (( f >= 5945 )); then base=5945                       # 6 GHz
+    elif (( f >= 5735 )); then base=5735                       # 5 GHz ch 149-177
+    elif (( f >= 5170 )); then base=5170                       # 5 GHz ch 36-144
+    elif (( f >= 2412 && f <= 2472 && w == 40 )); then         # 2.4 GHz: HT40+ for ch 1-7, HT40- for 8-13
+        if (( f <= 2442 )); then echo $(( f + 10 )); else echo $(( f - 10 )); fi
+        return
+    else
+        return 1
+    fi
+    echo $(( base + ((f - base) / w) * w + w / 2 ))
+}
+
+if [ "$1" = dev ] && [ "$2" = mon0 ] && [ "$3" = set ] \
+   && { [ "$4" = freq ] || [ "$4" = channel ]; } \
+   && [[ "$5" =~ ^[0-9]+$ ]] && (( $5 >= 2400 )) \
+   && { [ ! -e "$KEEP" ] || exit 0; } \
+   && ! $IW dev ap0 info >/dev/null 2>&1; then     # AP running: mon0 follows ap0, leave wlan1 alone
+    freq=$5
+    width=${6:-20}
+
+    ip link set wlan1 down 2>/dev/null
+    ip link set mon0 up 2>/dev/null
+
+    # 20 MHz is the default and the safety net: it is used when no width is
+    # given, for any width other than 40/80/160, when iw rejects the wide
+    # setting, and when iw accepts it but the radio did not really switch.
+    applied=0
+    case "$width" in
+        40|80|160)
+            c=${7:-}
+            [[ "$c" =~ ^[0-9]+$ ]] || c=$(centre "$freq" "$width")
+            if [ -n "$c" ] && $IW dev mon0 set freq "$freq" "$width" "$c" >/dev/null 2>&1 \
+               && $IW dev mon0 info 2>/dev/null | grep -q "width: $width MHz"; then
+                applied=1
+            fi ;;
+    esac
+    [ $applied -eq 0 ] && $IW dev mon0 set freq "$freq" >/dev/null 2>&1
+    exit 0
+fi
+
+output=$($IW "$@" 2>&1)
 ret=$?
 if [ $ret -ne 0 ] && echo "$output" | grep -qE "resource busy|Invalid argument"; then
-    # resource busy:     AP (ap0) owns the PHY channel — mon0 already on correct channel.
-    # Invalid argument:  wifidump passed a 6 GHz frequency (MHz) as a channel number
-    #                    (e.g. "set channel 6135"). Pre-set the frequency with
-    #                    'sudo mon0-set-channel freq <MHz>' before starting
-    #                    wifidump and enter the MHz value as the channel in Wireshark.
     exit 0
 fi
 [ -n "$output" ] && echo "$output" >&2
